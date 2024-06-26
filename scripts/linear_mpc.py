@@ -12,52 +12,86 @@ class LinearSystem:
     x_{k+1} = A*x_k + B*u_k
     y_k     = C*x_k"""
 
-    def __init__(self, A, B):
+    def __init__(self, A, B, lb, ub):
         self.A = A
         self.B = B
+        self.lb = lb
+        self.ub = ub
 
         self.nx = A.shape[0]  # state dimension
         self.nu = B.shape[1]  # input dimension
 
     def step(self, x, u):
-        u = np.minimum(u, 1.0)
-        u = np.maximum(u, -1.0)
+        u = np.minimum(u, self.ub)
+        u = np.maximum(u, self.lb)
         return self.A @ x + self.B @ u
 
-    def lookahead(self, x0, xs_des, Q, R):
-        # TODO this is for single shooting
-        # TODO this can be cleaned up a lot! (almost everything can be
-        # pre-computed)
-        N = xs_des.shape[0]
 
-        Abar = np.zeros((self.nx * N, self.nx))
-        Bbar = np.zeros((self.nx * N, self.nu * N))
-        Qbar = np.zeros((self.nx * N, self.nx * N))
-        Rbar = np.zeros((self.nu * N, self.nu * N))
+class SingleShootingLinearMPC:
+    """Linear MPC using single shooting."""
+    def __init__(self, sys, N, Q, R):
+        self.sys = sys
+        self.N = N
+
+        I = np.eye(N)
+        self.Qbar = np.kron(I, Q)
+        self.Rbar = np.kron(I, R)
+        self.lb = np.kron(np.ones(N), sys.lb)
+        self.ub = np.kron(np.ones(N), sys.ub)
 
         # TODO right now we don't include a separate QN for terminal condition
-        # Construct matrices
+        self.Abar = np.vstack([np.linalg.matrix_power(sys.A, k + 1) for k in range(N)])
+        self.Bbar = np.zeros((sys.nx * N, sys.nu * N))
         for k in range(N):
-            l = k * self.nx
-            u = (k + 1) * self.nx
-
-            Abar[k * self.nx : (k + 1) * self.nx, :] = np.linalg.matrix_power(self.A, k + 1)
-            Qbar[k * self.nx : (k + 1) * self.nx, k * self.nx : (k + 1) * self.nx] = Q
-            Rbar[k * self.nu : (k + 1) * self.nu, k * self.nu : (k + 1) * self.nu] = R
-
+            sx = np.s_[k * sys.nx : (k + 1) * sys.nx]
             for j in range(k + 1):
-                Bbar[k * self.nx : (k + 1) * self.nx, j * self.nu : (j + 1) * self.nu] = (
-                    np.linalg.matrix_power(self.A, k - j - 1) @ self.B
+                self.Bbar[sx, j * sys.nu : (j + 1) * sys.nu] = (
+                    np.linalg.matrix_power(sys.A, k - j - 1) @ sys.B
                 )
 
-        # TODO note H is independent of x0 and Yd, and is thus constant at each
-        # step
-        H = Rbar + Bbar.T @ Qbar @ Bbar
-        g = (Abar @ x0 - xs_des.flatten()).T @ Qbar @ Bbar
-        return H, g
+        self.H = self.Rbar + self.Bbar.T @ self.Qbar @ self.Bbar
+
+    def control(self, x, xs_des):
+        g = (self.Abar @ x - xs_des.flatten()).T @ self.Qbar @ self.Bbar
+
+        U = cp.Variable(self.sys.nu * self.N)
+        objective = cp.Minimize(0.5 * cp.quad_form(U, self.H) + g @ U)
+        constraints = [U >= self.lb, U <= self.ub]
+        problem = cp.Problem(objective, constraints)
+        problem.solve()
+        return U.value[: self.sys.nu]
 
 
-class PID(object):
+class MultiShootingLinearMPC:
+    """Linear MPC using multiple shooting."""
+    def __init__(self, sys, N, Q, R):
+        self.sys = sys
+        self.N = N
+
+        I = np.eye(N)
+        self.Qbar = np.kron(I, Q)
+        self.Rbar = np.kron(I, R)
+        self.Bbar = np.kron(I, sys.B)
+        self.Abar = np.kron(I, sys.A)
+        self.lb = np.kron(np.ones(N), sys.lb)
+        self.ub = np.kron(np.ones(N), sys.ub)
+
+    def control(self, x, xs_des):
+        U = cp.Variable(self.sys.nu * self.N)
+        X = cp.Variable(self.sys.nx * self.N)
+
+        objective = cp.Minimize(
+            0.5 * cp.quad_form(X - xs_des.flatten(), self.Qbar)
+            + 0.5 * cp.quad_form(U, self.Rbar)
+        )
+        X0 = cp.hstack((x, X[: -self.sys.nx]))
+        constraints = [X == self.Abar @ X0 + self.Bbar @ U, U >= self.lb, U <= self.ub]
+        problem = cp.Problem(objective, constraints)
+        problem.solve()
+        return U.value[: self.sys.nu]
+
+
+class PID:
     """PID controller."""
 
     def __init__(self, Kp, Ki, Kd):
@@ -96,67 +130,72 @@ def main():
 
     dt = 0.1
     tf = 10.0
-    num_steps = int(tf / dt)
+    num_steps = int(tf / dt) + 1
 
-    pid = PID(Kp=1, Ki=0.1, Kd=1)
-
-    # x+ = Ax + Bu
-    # y  = Cx
     A = np.array([[1, dt], [0, 1]])
     B = np.array([[0], [dt]])
+    ub = np.ones(nu)
+    lb = -ub
+    sys = LinearSystem(A, B, lb, ub)
 
-    sys = LinearSystem(A, B)
+    # controllers
+    pid = PID(Kp=1, Ki=0.1, Kd=1)
 
-    # V = x'Qx + u'Ru
     Q = np.diag([10, 0])
     R = np.eye(nu)
-    lb = np.ones(N * nu) * -1.0
-    ub = np.ones(N * nu) * 1.0
+    mpc_ss = SingleShootingLinearMPC(sys=sys, N=N, Q=Q, R=R)
+    mpc_ms = MultiShootingLinearMPC(sys=sys, N=N, Q=Q, R=R)
 
-    t = np.zeros(num_steps)
-    xs_des = np.zeros((num_steps, nx))
+    ts = dt * np.arange(num_steps)
+    xs_des = np.array([step(t) for t in ts])
+
     xs_pid = np.zeros((num_steps, nx))
-    xs_mpc = np.zeros((num_steps, nx))
-
-    U = cp.Variable(nu * N)
+    xs_ss = np.zeros((num_steps, nx))
+    xs_ms = np.zeros((num_steps, nx))
 
     for i in range(num_steps - 1):
-        # desired trajectory
-        xs_des[i, :] = step(t[i])
-
         # PID control
         err = xs_des[i, 0] - xs_pid[i, 0]
         u = pid.control(err, dt)
         xs_pid[i + 1, :] = sys.step(xs_pid[i, :], u)
 
+        # rollout the desired trajectory for MPC
+        xs_des_horizon = np.array([step(ts[i] + dt * j) for j in range(N)])
+
         # MPC (single-shooting)
-        xs_des_horizon = np.array([step(t[i] + dt * j) for j in range(N)])
-        H, g = sys.lookahead(xs_mpc[i, :], xs_des_horizon, Q, R)
+        u = mpc_ss.control(xs_ss[i, :], xs_des_horizon)
+        xs_ss[i + 1, :] = sys.step(xs_ss[i, :], u)
 
-        objective = cp.Minimize(0.5 * cp.quad_form(U, H) + g @ U)
-        constraints = [U >= lb, U <= ub]
-        problem = cp.Problem(objective, constraints)
-        problem.solve()
-        u = U.value[:sys.nu]
+        # MPC (multi-shooting)
+        u = mpc_ms.control(xs_ms[i, :], xs_des_horizon)
+        xs_ms[i + 1, :] = sys.step(xs_ms[i, :], u)
 
-        xs_mpc[i + 1, :] = sys.step(xs_mpc[i, :], u)
-        t[i + 1] = t[i] + dt
+    fig = plt.figure()
 
-    plt.subplot(211)
-    plt.plot(t, xs_des[:, 0], label="desired")
-    plt.plot(t, xs_pid[:, 0], label="actual")
+    plt.subplot(311)
+    plt.plot(ts, xs_des[:, 0], label="desired")
+    plt.plot(ts, xs_pid[:, 0], label="actual")
     plt.title("PID control")
     plt.legend()
     plt.grid()
 
-    plt.subplot(212)
-    plt.plot(t, xs_des[:, 0], label="desired")
-    plt.plot(t, xs_mpc[:, 0], label="actual")
+    plt.subplot(312)
+    plt.plot(ts, xs_des[:, 0], label="desired")
+    plt.plot(ts, xs_ss[:, 0], label="actual")
     plt.title("MPC (single shooting)")
     plt.legend()
     plt.grid()
     plt.xlabel("Time (s)")
 
+    plt.subplot(313)
+    plt.plot(ts, xs_des[:, 0], label="desired")
+    plt.plot(ts, xs_ms[:, 0], label="actual")
+    plt.title("MPC (multi shooting)")
+    plt.legend()
+    plt.grid()
+    plt.xlabel("Time (s)")
+
+    fig.tight_layout()
     plt.show()
 
 
