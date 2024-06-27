@@ -8,9 +8,7 @@ import cvxpy as cp
 
 
 class LinearSystem:
-    """Linear system of the form
-    x_{k+1} = A*x_k + B*u_k
-    y_k     = C*x_k"""
+    """Linear system of the form x_{k+1} = A*x_k + B*u_k."""
 
     def __init__(self, A, B, lb, ub):
         self.A = A
@@ -22,6 +20,7 @@ class LinearSystem:
         self.nu = B.shape[1]  # input dimension
 
     def step(self, x, u):
+        """Step the system forward in time."""
         u = np.minimum(u, self.ub)
         u = np.maximum(u, self.lb)
         return self.A @ x + self.B @ u
@@ -29,6 +28,7 @@ class LinearSystem:
 
 class SingleShootingLinearMPC:
     """Linear MPC using single shooting."""
+
     def __init__(self, sys, N, Q, R):
         self.sys = sys
         self.N = N
@@ -39,7 +39,6 @@ class SingleShootingLinearMPC:
         self.lb = np.kron(np.ones(N), sys.lb)
         self.ub = np.kron(np.ones(N), sys.ub)
 
-        # TODO right now we don't include a separate QN for terminal condition
         self.Abar = np.vstack([np.linalg.matrix_power(sys.A, k + 1) for k in range(N)])
         self.Bbar = np.zeros((sys.nx * N, sys.nu * N))
         for k in range(N):
@@ -51,8 +50,9 @@ class SingleShootingLinearMPC:
 
         self.H = self.Rbar + self.Bbar.T @ self.Qbar @ self.Bbar
 
-    def control(self, x, xs_des):
-        g = (self.Abar @ x - xs_des.flatten()).T @ self.Qbar @ self.Bbar
+    def solve(self, x, xs_des):
+        Xd = xs_des[1:, :].flatten()  # get rid of first state
+        g = (self.Abar @ x - Xd).T @ self.Qbar @ self.Bbar
 
         U = cp.Variable(self.sys.nu * self.N)
         objective = cp.Minimize(0.5 * cp.quad_form(U, self.H) + g @ U)
@@ -64,28 +64,38 @@ class SingleShootingLinearMPC:
 
 class MultiShootingLinearMPC:
     """Linear MPC using multiple shooting."""
+
     def __init__(self, sys, N, Q, R):
         self.sys = sys
         self.N = N
 
-        I = np.eye(N)
-        self.Qbar = np.kron(I, Q)
-        self.Rbar = np.kron(I, R)
-        self.Bbar = np.kron(I, sys.B)
-        self.Abar = np.kron(I, sys.A)
+        self.Qbar = np.kron(np.eye(N + 1), Q)
+        self.Rbar = np.kron(np.eye(N), R)
         self.lb = np.kron(np.ones(N), sys.lb)
         self.ub = np.kron(np.ones(N), sys.ub)
 
-    def control(self, x, xs_des):
-        U = cp.Variable(self.sys.nu * self.N)
-        X = cp.Variable(self.sys.nx * self.N)
+        self.Abar = np.zeros((self.sys.nx * self.N, self.sys.nx * (self.N + 1)))
+        self.Abar[:, : -self.sys.nx] = np.kron(np.eye(N), self.sys.A)
+        self.Abar[:, self.sys.nx :] += -np.eye(self.sys.nx * self.N)
 
-        objective = cp.Minimize(
-            0.5 * cp.quad_form(X - xs_des.flatten(), self.Qbar)
-            + 0.5 * cp.quad_form(U, self.Rbar)
-        )
-        X0 = cp.hstack((x, X[: -self.sys.nx]))
-        constraints = [X == self.Abar @ X0 + self.Bbar @ U, U >= self.lb, U <= self.ub]
+        self.Bbar = np.kron(np.eye(N), sys.B)
+
+    def solve(self, x, xs_des):
+        U = cp.Variable(self.sys.nu * self.N)
+        X = cp.Variable(self.sys.nx * (self.N + 1))
+
+        Xd = xs_des.flatten()
+
+        state_cost = 0.5 * cp.quad_form(X - Xd, self.Qbar)
+        input_cost = 0.5 * cp.quad_form(U, self.Rbar)
+
+        objective = cp.Minimize(state_cost + input_cost)
+        constraints = [
+            X[: self.sys.nx] == x,
+            self.Abar @ X + self.Bbar @ U == 0,
+            U >= self.lb,
+            U <= self.ub,
+        ]
         problem = cp.Problem(objective, constraints)
         problem.solve()
         return U.value[: self.sys.nu]
@@ -105,7 +115,7 @@ class PID:
         # integral error
         self.err_int = 0
 
-    def control(self, err, dt):
+    def solve(self, err, dt):
         """Generate control signal u to drive e to zero."""
         derr = (err - self.err_prev) / dt
         self.err_prev = err
@@ -114,9 +124,7 @@ class PID:
         return np.atleast_1d(u)
 
 
-def step(t):
-    """Desired trajectory"""
-    # step
+def desired_state(t):
     if t < 1.0:
         return [0.0, 0]
     return [1.0, 0]
@@ -125,7 +133,6 @@ def step(t):
 def main():
     nx = 2  # state dimension
     nu = 1  # input dimension
-
     N = 10  # number of lookahead steps
 
     dt = 0.1
@@ -147,7 +154,7 @@ def main():
     mpc_ms = MultiShootingLinearMPC(sys=sys, N=N, Q=Q, R=R)
 
     ts = dt * np.arange(num_steps)
-    xs_des = np.array([step(t) for t in ts])
+    xs_des = np.array([desired_state(t) for t in ts])
 
     xs_pid = np.zeros((num_steps, nx))
     xs_ss = np.zeros((num_steps, nx))
@@ -156,18 +163,18 @@ def main():
     for i in range(num_steps - 1):
         # PID control
         err = xs_des[i, 0] - xs_pid[i, 0]
-        u = pid.control(err, dt)
+        u = pid.solve(err, dt)
         xs_pid[i + 1, :] = sys.step(xs_pid[i, :], u)
 
         # rollout the desired trajectory for MPC
-        xs_des_horizon = np.array([step(ts[i] + dt * j) for j in range(N)])
+        xs_des_horizon = np.array([desired_state(ts[i] + dt * j) for j in range(N + 1)])
 
         # MPC (single-shooting)
-        u = mpc_ss.control(xs_ss[i, :], xs_des_horizon)
+        u = mpc_ss.solve(xs_ss[i, :], xs_des_horizon)
         xs_ss[i + 1, :] = sys.step(xs_ss[i, :], u)
 
         # MPC (multi-shooting)
-        u = mpc_ms.control(xs_ms[i, :], xs_des_horizon)
+        u = mpc_ms.solve(xs_ms[i, :], xs_des_horizon)
         xs_ms[i + 1, :] = sys.step(xs_ms[i, :], u)
 
     fig = plt.figure()

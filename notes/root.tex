@@ -1,0 +1,183 @@
+\documentclass{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage{parskip}
+\usepackage{amssymb,amsfonts,amsmath,amscd,amsthm}
+\usepackage{bm}
+\usepackage{hyperref}
+\usepackage[pdftex]{graphicx}
+\usepackage{url}
+\usepackage[usenames,dvipsnames]{color}
+\usepackage{enumitem}
+\usepackage{mathtools}
+\usepackage{float}
+
+% for typesetting in-text numbers and units
+\usepackage{siunitx}
+
+% improved typesetting
+\usepackage{microtype}
+
+% Useful commands.
+\input{commands}
+
+\title{Model Predictive Control}
+\author{Adam Heins}
+
+\begin{document}
+
+\maketitle
+
+Here we derive some basic model predictive controllers.
+
+\section{Linear MPC}
+
+Suppose we have a discrete-time linear time-invariant system of the form
+\begin{equation*}
+  \bm{x}_{k+1} = \bm{A}\bm{x}_k + \bm{B}\bm{u}_k,
+\end{equation*}
+where~$\bm{x}_k$ and~$\bm{u}_k$ are the state and input at the $k$th timestep,
+respectively. Consider the optimal control problem
+\begin{equation}\label{eq:ocp}
+  \begin{aligned}
+    \minimize &\quad \ell_f(\bm{x}_N) + \sum_{k=0}^{N-1} \ell(\bm{x}_k,\bm{u}_k) \\
+    \text{subject to} &\quad \bm{x}_{k+1} = \bm{A}\bm{x}_k + \bm{B}\bm{u}_k, \quad k=0,\dots,N, \\
+                      &\quad \bm{u}_k\in\mathcal{U}, \quad k=0,\dots,N-1, \\
+                      &\quad \bm{x}_k\in\mathcal{X}, \quad k=0,\dots,N-1, \\
+                      &\quad \bm{x}_N\in\mathcal{X}_f,
+  \end{aligned}
+\end{equation}
+where we are trying to find the control inputs~$\bm{u}$ that minimize the total
+cost (running cost~$\ell$ and terminal cost~$\ell_f$) over a horizon of~$N$
+steps subject to the dynamics and state and input constraints.
+
+Let us consider how to solve~\eqref{eq:ocp}. Define the \emph{lifted} state and
+input vectors
+\begin{align*}
+  \bar{\bm{x}} &= \begin{bmatrix} \bm{x}_0^T,\dots,\bm{x}_N^T \end{bmatrix}^T, &
+  \bar{\bm{u}} &= \begin{bmatrix} \bm{u}_0^T,\dots,\bm{u}_{N-1}^T \end{bmatrix}^T,
+\end{align*}
+and let us take the costs to be
+\begin{align*}
+  \ell(\bm{x},\bm{u}) &= \bm{x}^T\bm{Q}\bm{x} + \bm{u}^T\bm{R}\bm{u}, \\
+  \ell_f(\bm{x}) &= \bm{x}^T\bm{Q}\bm{x},
+\end{align*}
+for positive definite~$\bm{Q}$ and~$\bm{R}$. We have assumed that the terminal
+cost is the same as the running cost for simplicity. We will take the input
+constraints to be the bounds~$\mathcal{U}=\{\bm{u}\mid
+\bm{u}_{\min}\leq\bm{u}\leq\bm{u}_{\max}\}$ and we will omit the state
+constraints entirely. So far we have assumed that we are regulating the system
+to the origin~$\bm{x}=\bm{0}$, but we will also discuss tracking a desired
+trajectory~$\bar{\bm{x}}_d$.
+
+\subsection{Multiple shooting}
+
+In a multiple shooting approach, we optimize over both~$\bar{\bm{x}}$
+and~$\bar{\bm{u}}$. Let us define the matrices
+\begin{align*}
+  \bar{\bm{A}} &= \begin{bmatrix} \bm{A} & -\bm{I} & \bm{0} \\ \bm{0} & \bm{A} & -\bm{I} \\ & & \ddots & \ddots \end{bmatrix} &
+  \bar{\bm{B}} &= \diag(\bm{B})^{N} \\
+  \bar{\bm{Q}} &= \diag(\bm{Q})^{N+1}, & \bar{\bm{R}} &= \diag(\bm{R})^N,
+\end{align*}
+where~$\bm{I}$ is the identity matrix and~$\diag(\bm{X})^n$ is a block diagonal
+matrix with~$n$ blocks of the matrix~$\bm{X}$.
+Given the actual value of the current state~$\hat{\bm{x}}_0$, the
+OCP~\eqref{eq:ocp} can be formulated as the quadratic program
+\begin{equation}\label{eq:mpc_ms}
+  \begin{aligned}
+    \minimize_{\bar{\bm{x}},\bar{\bm{u}}} &\quad \bar{\bm{x}}^T\bar{\bm{Q}}\bar{\bm{x}} + \bar{\bm{u}}^T\bar{\bm{R}}\bar{\bm{u}} \\
+    \text{subject to} &\quad \bm{x}_0 = \hat{\bm{x}}_0 \\
+                      &\quad \bar{\bm{A}}\bar{\bm{x}} + \bar{\bm{B}}\bar{\bm{u}} = \bm{0} \\
+                      &\quad \bar{\bm{u}}_{\min} \leq \bar{\bm{u}} \leq \bar{\bm{u}}_{\max}.
+  \end{aligned}
+\end{equation}
+If we want to track a desired trajectory~$\bar{\bm{x}}_d$, then we add the
+linear term~$-2\bar{\bm{x}}_d^T\bar{\bm{Q}}\bar{\bm{x}}$ to the cost.
+
+\subsection{Single shooting}
+
+In a single shooting approach, we eliminate the state variables and optimize
+only over~$\bar{\bm{u}}$. Let us (re)define the matrices
+\begin{align*}
+  \bar{\bm{A}} &= \begin{bmatrix} \bm{I} \\ \bm{A} \\ \bm{A}^2 \\ \vdots \\ \bm{A}^{N} \end{bmatrix}, &
+  \bar{\bm{B}} &= \begin{bmatrix}
+    \bm{0} & \bm{0} & \bm{0} & \hdots \\
+    \bm{B} & \bm{0} & \bm{0} & \hdots \\
+    \bm{A}\bm{B} & \bm{B} & \bm{0} \\
+    \bm{A}^{2}\bm{B} & \bm{A}\bm{B} & \bm{B} \\
+    \vdots & & & \ddots \\ \bm{A}^{N-1}\bm{B}
+  \end{bmatrix},
+\end{align*}
+such that~$\bar{\bm{x}}=\bar{\bm{A}}\hat{\bm{x}}_0 + \bar{\bm{B}}\bar{\bm{u}}$.
+The objective function becomes
+\begin{equation*}
+  \begin{aligned}
+    \bar{\bm{x}}^T\bar{\bm{Q}}\bar{\bm{x}} + \bar{\bm{u}}^T\bar{\bm{R}}\bar{\bm{u}} &= (\bar{\bm{A}}\hat{\bm{x}}_0 + \bar{\bm{B}}\bar{\bm{u}})^T\bar{\bm{Q}}(\bar{\bm{A}}\hat{\bm{x}}_0 + \bar{\bm{B}}\bar{\bm{u}}) + \bar{\bm{u}}^T\bar{\bm{R}}\bar{\bm{u}} \\
+                                                                                    &= \hat{\bm{x}}_0^T\bar{\bm{A}}^T\bar{\bm{Q}}\bar{\bm{A}}\hat{\bm{x}}_0 + 2\hat{\bm{x}}_0^T\bar{\bm{A}}^T\bar{\bm{Q}}\bar{\bm{B}}\bar{\bm{u}} + \bar{\bm{u}}^T(\bar{\bm{R}}+\bar{\bm{B}}^T\bar{\bm{Q}}\bar{\bm{B}})\bar{\bm{u}},
+  \end{aligned}
+\end{equation*}
+where the first term is constant and so can be omitted from the optimization
+problem. We have also eliminated the dynamics equality constraints,
+so~\eqref{eq:ocp} just becomes the quadratic program
+\begin{equation}\label{eq:mpc_ss}
+  \begin{aligned}
+    \minimize_{\bar{\bm{u}}} &\quad (1/2)\bar{\bm{u}}^T(\bar{\bm{R}}+\bar{\bm{B}}^T\bar{\bm{Q}}\bar{\bm{B}})\bar{\bm{u}} + \hat{\bm{x}}_0^T\bar{\bm{A}}^T\bar{\bm{Q}}\bar{\bm{B}}\bar{\bm{u}} \\
+    \text{subject to} &\quad \bar{\bm{u}}_{\min} \leq \bar{\bm{u}} \leq \bar{\bm{u}}_{\max}.
+  \end{aligned}
+\end{equation}
+If we want to track a desired trajectory~$\bar{\bm{x}}_d$, then we modify the
+linear term of the cost
+to~$(\bar{\bm{A}}\hat{\bm{x}}_0-\bar{\bm{x}}_d)^T\bar{\bm{Q}}\bar{\bm{B}}\bar{\bm{u}}$.
+
+\section{Nonlinear MPC}
+
+Suppose now we have a discrete-time nonlinear system of the form
+\begin{equation}\label{eq:nonlinear}
+  \bm{x}_{k+1} = \bm{f}(\bm{x}_k,\bm{u}_k).
+\end{equation}
+We will proceed in a similar way as the linear MPC case by \emph{linearizing}
+the system about a trajectory~$(\tilde{\bm{x}},\tilde{\bm{u}})$, yielding
+\begin{align*}
+  \bm{A}_k &= \pd{\bm{f}}{\bm{x}}\evalat_{(\tilde{\bm{x}}_k,\tilde{\bm{u}}_k)}, &
+  \bm{B}_k &= \pd{\bm{f}}{\bm{u}}\evalat_{(\tilde{\bm{x}}_k,\tilde{\bm{u}}_k)}.
+\end{align*}
+At each timestep, our approach will be to iteratively linearize about some
+nominal trajectory, then formulate and solve a QP similar to the above.
+However, differently from the linear case, we will iteratively re-linearize and
+solve the QP, until the solution has converged (or we have run out of compute
+time). That means that each QP will solve for an update to the current
+solution, rather than the solution directly. We will use a multiple shooting
+approach.
+
+Let~$\tilde{\bm{x}}$ and~$\tilde{\bm{u}}$ be the lifted state and input
+trajectories from the previous iteration (we can initialize~$\tilde{\bm{u}}$
+from the previous timestep or simply with all zeros, then roll
+out~$\tilde{\bm{x}}$ using the nonlinear dynamics~\eqref{eq:nonlinear}). Then
+we want to solve for updates~$\delta\bar{\bm{x}}$ and~$\delta\bar{\bm{u}}$ to
+obtain a new optimal trajectory
+\begin{align*}
+  \bar{\bm{x}} &= \tilde{\bm{x}} + \delta\bar{\bm{x}}, \\
+  \bar{\bm{u}} &= \tilde{\bm{u}} + \delta\bar{\bm{u}}.
+\end{align*}
+Let us define the matrices
+\begin{align*}
+  \bar{\bm{A}} &= \begin{bmatrix} \bm{A}_0 & -\bm{I} & \bm{0} \\ \bm{0} & \bm{A}_1 & -\bm{I} \\ & & \ddots & \ddots \\ & & & \bm{A}_{N-1} & -\bm{I} \end{bmatrix}, &
+  \bar{\bm{B}} &= \begin{bmatrix} \bm{B}_0 & \bm{0} \\ \bm{0} & \bm{B}_1 \\ & & \ddots \\ & & & \bm{B}_{N-1} \end{bmatrix},
+\end{align*}
+Substituting into~\eqref{eq:mpc_ms}, we get
+\begin{equation}\label{eq:mpc_nl}
+  \begin{aligned}
+    \minimize_{\delta\bar{\bm{x}},\delta\bar{\bm{u}}} &\quad (1/2)\delta\bar{\bm{x}}^T\bar{\bm{Q}}\delta\bar{\bm{x}} + (1/2)\delta\bar{\bm{u}}^T\bar{\bm{R}}\delta\bar{\bm{u}} + \tilde{\bm{x}}^T\bar{\bm{Q}}\delta\bar{\bm{x}} + \tilde{\bm{u}}^T\bar{\bm{R}}\delta\bar{\bm{u}}\\
+    \text{subject to} &\quad \delta\bm{x}_0 = \bm{0} \\
+                      &\quad \bar{\bm{A}}\delta\bar{\bm{x}} + \bar{\bm{B}}\delta\bar{\bm{u}} + \bar{\bm{A}}\tilde{\bm{x}} + \bar{\bm{B}}\tilde{\bm{u}}= \bm{0} \\
+                      &\quad \bar{\bm{u}}_{\min}-\tilde{\bm{u}} \leq \delta\bar{\bm{u}} \leq \bar{\bm{u}}_{\max}-\tilde{\bm{u}},
+  \end{aligned}
+\end{equation}
+which we can iterate at each timestep as desired.
+If we want to track a desired trajectory~$\bar{\bm{x}}_d$, then we add the
+linear term~$-\bar{\bm{x}}_d^T\bar{\bm{Q}}\delta\bar{\bm{x}}$ to the cost. Note
+that if more complex constraints are included in the OCP, then we likely need
+to employ a filter or line-search method to determine the optimal step size,
+rather than taking a full step at each iteration.
+
+\end{document}
